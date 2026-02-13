@@ -157,7 +157,7 @@ def parse_sales_volume_parameters(sales_raw: pd.DataFrame):
     return median_sales_df, growth_df, year_map, years_needed, needed_maturities
 
 # =============================
-# ✅ NEW: archetype-specific yield + conversion (ONLY CHANGE)
+# Archetype-specific yield + conversion
 # =============================
 def prep_yield_conv_with_archetype(conv_tab, yield_tab, params_tab):
     # mapping Parent0 -> Archetype
@@ -207,7 +207,7 @@ def get_archetype_means(archetype, yield_w_arch, conv_w_arch, fallback_y, fallba
     return y_mean, c_mean
 
 # =============================
-# Lifecycle logic (same except uses archetype y_mean/c_mean)
+# Lifecycle logic
 # =============================
 def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map, years_needed,
                       yield_w_arch, conv_w_arch, fallback_y, fallback_c):
@@ -230,7 +230,7 @@ def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map
         raw = rowg[year_map[y]].iloc[0] if y in year_map else np.nan
         yoy.append(_to_rate(raw))
 
-    # ✅ archetype-specific yield/conv (ONLY CHANGE)
+    # archetype-specific yield/conv
     y_mean, c_mean = get_archetype_means(archetype, yield_w_arch, conv_w_arch, fallback_y, fallback_c)
 
     # Sales Year1..Year10
@@ -284,7 +284,7 @@ def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map
     return cols, sales[:10], lifecycle_df, y_mean, c_mean
 
 # =============================
-# PRODUCTION MASTER (unchanged)
+# PRODUCTION MASTER
 # =============================
 def build_master_for_production(prod: pd.DataFrame, pp: pd.DataFrame) -> pd.DataFrame:
     if "Parent0" not in pp.columns:
@@ -335,18 +335,15 @@ if not uploaded:
 
 conv_tab, yield_tab, params_tab, sales_raw = load_required_sheets(uploaded)
 
-# ✅ NEW: prep archetype-specific yield & conversion
+# prep archetype-specific yield & conversion
 yield_w_arch, conv_w_arch, fallback_y, fallback_c = prep_yield_conv_with_archetype(conv_tab, yield_tab, params_tab)
 
-# top KPI cards (overall fallback means)
-k1, k2 = st.columns(2)
-k1.metric("Yield factor (overall mean)", f"{fallback_y:.4f}" if pd.notna(fallback_y) else "NA")
-k2.metric("Conversion rate (overall mean)", f"{fallback_c:.4f}" if pd.notna(fallback_c) else "NA")
+# ✅ Removed top KPI cards (overall mean) as requested
 
 tabs = st.tabs(["Maturity distribution", "Production volume", "Inventory lifecycle"])
 
 # =============================
-# TAB: Maturity distribution (same nice charts)
+# TAB: Maturity distribution
 # =============================
 with tabs[0]:
     st.subheader("Maturity distribution")
@@ -440,7 +437,7 @@ with tabs[0]:
         st.info("No 'Archetype' column found in Product parameters; skipping Archetype view.")
 
 # =============================
-# TAB: Production volume (same nice charts)
+# TAB: Production volume
 # =============================
 with tabs[1]:
     st.subheader("Production volume")
@@ -517,7 +514,7 @@ with tabs[1]:
             st.plotly_chart(fig2, use_container_width=True)
 
 # =============================
-# TAB: Inventory lifecycle (same working logic + ONLY yield/conv changed)
+# TAB: Inventory lifecycle
 # =============================
 with tabs[2]:
     st.subheader("Inventory lifecycle (Sales + Remaining inventory)")
@@ -540,7 +537,10 @@ with tabs[2]:
         if lifecycle_df is None:
             st.warning("No data found for this Archetype + Maturity combination.")
         else:
-            st.info(f"Using Archetype-specific means → Yield: {y_mean:.4f} | Conversion: {c_mean:.4f}")
+            # ✅ Show big KPI cards here (instead of st.info line)
+            c1, c2 = st.columns(2)
+            c1.metric("Yield factor (Archetype mean)", f"{y_mean:.4f}")
+            c2.metric("Conversion rate (Archetype mean)", f"{c_mean:.4f}")
 
             st.dataframe(lifecycle_df.round(1), use_container_width=True)
 
