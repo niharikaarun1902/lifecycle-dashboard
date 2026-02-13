@@ -13,22 +13,10 @@ MATURITY_BINS   = [0, 85, 95, 105, 115, 999]
 MATURITY_LABELS = ["≤85", "86-95", "96-105", "106-115", "116+"]
 
 # ----------------------------
-# Utilities
+# Helpers
 # ----------------------------
 def maturity_bin(series: pd.Series) -> pd.Categorical:
     return pd.cut(series, bins=MATURITY_BINS, labels=MATURITY_LABELS, right=True, include_lowest=True)
-
-def pick_col(df: pd.DataFrame, keywords, required=False):
-    cols = list(df.columns)
-    low = [str(c).lower().strip() for c in cols]
-    for kw in keywords:
-        kw = kw.lower().strip()
-        for i, c in enumerate(low):
-            if kw in c:
-                return cols[i]
-    if required:
-        raise KeyError(f"Could not find column with keywords={keywords}. Available columns={cols}")
-    return None
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -58,6 +46,29 @@ def _to_rate(x):
     v = float(x)
     return v / 100.0 if abs(v) > 2 else v
 
+def make_unique(cols):
+    """Make duplicate column names unique: Archetype, Archetype__2, Archetype__3, ..."""
+    seen = {}
+    out = []
+    for c in cols:
+        c = "" if c is None else str(c).strip()
+        if c == "":
+            c = "blank"
+        if c not in seen:
+            seen[c] = 1
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c}__{seen[c]}")
+    return out
+
+def is_numlike(s: str) -> bool:
+    try:
+        float(str(s).strip())
+        return True
+    except:
+        return False
+
 @st.cache_data(show_spinner=False)
 def load_workbook(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
@@ -82,7 +93,6 @@ def compute_yield_and_conv_means(conv_tab, yield_tab):
     else:
         yield_mean = np.nan
 
-    # Conversion mean = totalConversionRate mean
     if "totalConversionRate" in conv_tab.columns:
         conv_tab["totalConversionRate"] = pd.to_numeric(conv_tab["totalConversionRate"], errors="coerce")
         conv_mean = conv_tab["totalConversionRate"].mean()
@@ -95,31 +105,41 @@ def build_master_for_production(dfs):
     params = dfs["Product parameters"].copy()
     prod   = dfs["Production yields"].copy()
 
-    # robust cols
-    PARENT_COL  = pick_col(params, ["parent0", "parent"], required=True)
-    TRAIT_COL   = pick_col(params, ["trait"], required=True)
-    MAT_COL     = pick_col(params, ["maturity"], required=True)
-    ARCH_COL    = pick_col(params, ["archetype"], required=False)
+    # expect these exact names in your workbook
+    # (your file already worked for other tabs, so we keep it simple)
+    if "Parent0" not in params.columns:
+        # fallback: try common variants
+        parent = [c for c in params.columns if "parent" in c.lower()]
+        if not parent:
+            raise KeyError("Could not find Parent column in Product parameters.")
+        params = params.rename(columns={parent[0]: "Parent0"})
+    if "Trait" not in params.columns:
+        trait = [c for c in params.columns if "trait" in c.lower()]
+        if not trait:
+            raise KeyError("Could not find Trait column in Product parameters.")
+        params = params.rename(columns={trait[0]: "Trait"})
+    if "Maturity" not in params.columns:
+        mat = [c for c in params.columns if "maturity" in c.lower()]
+        if not mat:
+            raise KeyError("Could not find Maturity column in Product parameters.")
+        params = params.rename(columns={mat[0]: "Maturity"})
 
-    params[MAT_COL] = pd.to_numeric(params[MAT_COL], errors="coerce")
-    params[TRAIT_COL] = params[TRAIT_COL].astype(str).str.strip()
-    if ARCH_COL:
-        params[ARCH_COL] = params[ARCH_COL].astype(str).str.strip()
+    has_arch = "Archetype" in params.columns
 
-    # numeric cols in prod
+    params["Maturity"] = pd.to_numeric(params["Maturity"], errors="coerce")
+    params["Trait"] = params["Trait"].astype(str).str.strip()
+    if has_arch:
+        params["Archetype"] = params["Archetype"].astype(str).str.strip()
+
     for col in ["Qactual (bu)", "Actual yield", "area (ac)", "Planned yield (bu/ac)"]:
         if col in prod.columns:
             prod[col] = pd.to_numeric(prod[col], errors="coerce")
 
-    # merge
-    keep_cols = [PARENT_COL, TRAIT_COL, MAT_COL] + ([ARCH_COL] if ARCH_COL else [])
-    prm = params[keep_cols].rename(columns={PARENT_COL: "Parent0", TRAIT_COL: "Trait", MAT_COL: "Maturity"})
-    if ARCH_COL:
-        prm = prm.rename(columns={ARCH_COL: "Archetype"})
+    keep = ["Parent0", "Trait", "Maturity"] + (["Archetype"] if has_arch else [])
+    prm = params[keep].copy()
 
     master = prod.merge(prm, on="Parent0", how="left")
 
-    # production volume
     if "Qactual (bu)" in master.columns and master["Qactual (bu)"].notna().sum() > 0:
         master["Production_Volume"] = master["Qactual (bu)"]
     elif "area (ac)" in master.columns and "Actual yield" in master.columns:
@@ -132,103 +152,69 @@ def build_master_for_production(dfs):
     return master
 
 # ----------------------------
-# Sales tables parsing (UPDATED for your matrix format)
+# Sales parsing (robust to duplicate headers)
 # ----------------------------
-def find_header(sales_raw: pd.DataFrame, start_col_min=0):
+def find_all_archetype_headers(sales_raw: pd.DataFrame):
+    rows = []
     for r in range(sales_raw.shape[0]):
-        for c in range(start_col_min, sales_raw.shape[1] - 1):
-            a = str(sales_raw.iat[r, c]).strip().lower()
-            b = str(sales_raw.iat[r, c + 1]).strip().lower()
-            if a == "archetype" and b == "maturity":
-                return r, c
-    return None, None
+        if str(sales_raw.iat[r, 0]).strip().lower() == "archetype":
+            rows.append(r)
+    return rows
 
 def parse_sales_tables(sales_raw: pd.DataFrame):
     """
-    Supports two formats for first-year sales:
-    A) "Long" table: Archetype | Maturity | Median/Average first year sales volumes
-    B) "Wide/matrix": Archetype | 85 | 95 | 105 | 115 | ...   (maturity columns)
-
-    Also finds the YoY growth table: Archetype | Maturity | 2 | 3 | ... (years)
+    Your sheet structure (from errors):
+    - First-year sales table is a MATRIX:
+        Archetype | 85 | 95 | 105 | 115 | ...
+    - YoY growth table exists somewhere below:
+        Archetype | Maturity | 2 | 3 | ... | 15
+    - Headers may repeat (duplicate labels). We make them unique to avoid pandas errors.
     """
 
-    # ---------- Find a header row where col0 == "Archetype" ----------
-    header_row = None
-    for r in range(sales_raw.shape[0]):
-        v = str(sales_raw.iat[r, 0]).strip().lower()
-        if v == "archetype":
-            header_row = r
-            break
-    if header_row is None:
-        raise ValueError("Could not find 'Archetype' header in Sales volume parameters.")
+    # 1) Find header rows where first cell == Archetype
+    arch_header_rows = find_all_archetype_headers(sales_raw)
+    if not arch_header_rows:
+        raise ValueError("Could not find an 'Archetype' header row in Sales volume parameters.")
 
-    header = sales_raw.iloc[header_row].tolist()
-    header = [str(x).strip() if not pd.isna(x) else "" for x in header]
+    # 2) First-year matrix is the FIRST Archetype header row
+    fy_header_row = arch_header_rows[0]
 
-    data = sales_raw.iloc[header_row + 1 :].copy()
+    raw_header = sales_raw.iloc[fy_header_row].tolist()
+    header = make_unique(raw_header)
+
+    data = sales_raw.iloc[fy_header_row + 1 :].copy()
     data.columns = header
 
-    # Drop empty rows (must have Archetype)
-    if "Archetype" not in data.columns:
-        raise ValueError("Sales volume parameters: could not create table with 'Archetype' column.")
-    data = data[data["Archetype"].notna()].copy()
-    data["Archetype"] = data["Archetype"].astype(str).str.strip()
+    # Ensure we use the first 'Archetype' column (could be Archetype__2 etc.)
+    arch_col = "Archetype" if "Archetype" in data.columns else None
+    if arch_col is None:
+        # fallback: any col starting with Archetype
+        candidates = [c for c in data.columns if str(c).startswith("Archetype")]
+        if not candidates:
+            raise ValueError("Could not locate an Archetype column in first-year table.")
+        arch_col = candidates[0]
 
-    # ---------- Detect maturity columns (wide matrix case) ----------
-    maturity_cols = []
-    for c in data.columns:
-        if c in ["Archetype", "Maturity"]:
-            continue
-        try:
-            float(c)  # columns like "85", "95.0", "105.0"
-            maturity_cols.append(c)
-        except:
-            pass
+    data = data[data[arch_col].notna()].copy()
+    data[arch_col] = data[arch_col].astype(str).str.strip()
 
-    first_year_col = "FirstYearSales"
-    first_tbl = None
+    # First-year maturity columns are numeric column names
+    maturity_cols = [c for c in data.columns if c != arch_col and is_numlike(c)]
+    if not maturity_cols:
+        raise ValueError(f"Could not detect maturity columns (85/95/105...) in first-year table. Columns={list(data.columns)}")
 
-    # ---------- Case A: long table ----------
-    if "Maturity" in data.columns:
-        candidates = [
-            "Median first year sales volumes",
-            "Average first year sales volumes",
-            "First year sales volumes",
-        ]
-        fy = None
-        for cand in candidates:
-            if cand in data.columns:
-                fy = cand
-                break
-        if fy is None:
-            for c in data.columns:
-                cl = str(c).lower()
-                if "first year" in cl and "sales" in cl:
-                    fy = c
-                    break
+    wide = data[[arch_col] + maturity_cols].copy()
+    for c in maturity_cols:
+        wide[c] = pd.to_numeric(wide[c], errors="coerce")
 
-        if fy is not None:
-            first_tbl = data[["Archetype", "Maturity", fy]].copy()
-            first_tbl["Maturity"] = pd.to_numeric(first_tbl["Maturity"], errors="coerce")
-            first_tbl[fy] = pd.to_numeric(first_tbl[fy], errors="coerce")
-            first_tbl = first_tbl.rename(columns={fy: first_year_col})
+    first_tbl = wide.melt(id_vars=[arch_col], var_name="Maturity", value_name="FirstYearSales")
+    first_tbl = first_tbl.rename(columns={arch_col: "Archetype"})
+    first_tbl["Maturity"] = pd.to_numeric(first_tbl["Maturity"], errors="coerce")
+    first_tbl["FirstYearSales"] = pd.to_numeric(first_tbl["FirstYearSales"], errors="coerce")
+    first_tbl = first_tbl.dropna(subset=["Archetype", "Maturity", "FirstYearSales"]).copy()
 
-    # ---------- Case B: wide/matrix ----------
-    if first_tbl is None:
-        if len(maturity_cols) == 0:
-            raise ValueError(f"Could not detect maturity columns for first-year matrix. Columns={list(data.columns)}")
-
-        wide = data[["Archetype"] + maturity_cols].copy()
-        for c in maturity_cols:
-            wide[c] = pd.to_numeric(wide[c], errors="coerce")
-
-        first_tbl = wide.melt(id_vars=["Archetype"], var_name="Maturity", value_name=first_year_col)
-        first_tbl["Maturity"] = pd.to_numeric(first_tbl["Maturity"], errors="coerce")
-        first_tbl = first_tbl.dropna(subset=[first_year_col, "Maturity"]).copy()
-
-    # ---------- Find YoY growth table header: (Archetype, Maturity) somewhere later ----------
+    # 3) YoY table: find a row with adjacent cells "Archetype" and "Maturity"
     yoy_header_row, yoy_start_col = None, None
-    for r in range(header_row + 1, sales_raw.shape[0]):
+    for r in range(fy_header_row + 1, sales_raw.shape[0]):
         for c in range(sales_raw.shape[1] - 1):
             a = str(sales_raw.iat[r, c]).strip().lower()
             b = str(sales_raw.iat[r, c + 1]).strip().lower()
@@ -241,32 +227,32 @@ def parse_sales_tables(sales_raw: pd.DataFrame):
     if yoy_header_row is None:
         raise ValueError("Could not find YoY growth table header (Archetype, Maturity).")
 
-    yoy_cols = list(sales_raw.iloc[yoy_header_row, yoy_start_col:].values)
-    yoy_cols = [str(x).strip() if not pd.isna(x) else "" for x in yoy_cols]
+    yoy_raw_header = list(sales_raw.iloc[yoy_header_row, yoy_start_col:].values)
+    yoy_header = make_unique(yoy_raw_header)
 
     yoy = sales_raw.iloc[yoy_header_row + 1 :, yoy_start_col:].copy()
-    yoy.columns = yoy_cols
-    yoy = yoy[yoy["Archetype"].notna()].copy()
+    yoy.columns = yoy_header
 
-    yoy["Archetype"] = yoy["Archetype"].astype(str).str.strip()
-    yoy["Maturity"] = pd.to_numeric(yoy["Maturity"], errors="coerce")
+    # Identify proper archetype/maturity columns (may be Archetype__2, Maturity__2)
+    yoy_arch = "Archetype" if "Archetype" in yoy.columns else [c for c in yoy.columns if str(c).startswith("Archetype")][0]
+    yoy_mat  = "Maturity"  if "Maturity"  in yoy.columns else [c for c in yoy.columns if str(c).startswith("Maturity")][0]
 
-    # year cols: numeric-ish like 2, 3, 4...
-    year_cols = []
-    for c in yoy.columns:
-        if c in ["Archetype", "Maturity"]:
-            continue
-        try:
-            float(c)
-            year_cols.append(c)
-        except:
-            pass
+    yoy = yoy[yoy[yoy_arch].notna()].copy()
+    yoy[yoy_arch] = yoy[yoy_arch].astype(str).str.strip()
+    yoy[yoy_mat] = pd.to_numeric(yoy[yoy_mat], errors="coerce")
+    yoy = yoy.rename(columns={yoy_arch: "Archetype", yoy_mat: "Maturity"})
 
+    # Year columns are numeric-ish (2..15)
+    year_cols = [c for c in yoy.columns if c not in ["Archetype", "Maturity"] and is_numlike(c)]
+    if not year_cols:
+        raise ValueError("Could not find YoY year columns (2..15).")
+
+    # Convert rates
     for c in year_cols:
         yoy[c] = yoy[c].apply(_to_rate)
 
-    year_cols = sorted(year_cols, key=lambda x: float(x))
-    return first_tbl, first_year_col, yoy, year_cols
+    year_cols = sorted(year_cols, key=lambda x: float(str(x)))
+    return first_tbl, "FirstYearSales", yoy, year_cols
 
 def build_lifecycle(archetype, maturity, first_tbl, first_year_col, yoy_tbl, year_cols, yield_mean, conv_mean):
     row = first_tbl[(first_tbl["Archetype"] == archetype) & (first_tbl["Maturity"] == maturity)]
@@ -274,24 +260,23 @@ def build_lifecycle(archetype, maturity, first_tbl, first_year_col, yoy_tbl, yea
         return None
 
     y1 = float(row.iloc[0][first_year_col])
+
     grow = yoy_tbl[(yoy_tbl["Archetype"] == archetype) & (yoy_tbl["Maturity"] == maturity)]
     if grow.empty:
         return None
 
+    # Build sales for 10 years: Year1 + compounded using YoY rates columns (2..15)
     rates = [float(grow.iloc[0][c]) for c in year_cols]
     sales = [y1]
+    # Use rates starting from year 2 onward
     for rate in rates[1:]:
-        nxt = sales[-1] * (1 + rate)
-        sales.append(max(nxt, 0.0))
+        sales.append(max(sales[-1] * (1 + rate), 0.0))
+    sales = (sales[:10] + [0.0] * 10)[:10]
 
-    sales = sales[:10] + [0.0] * max(0, 10 - len(sales))
-    sales = sales[:10]
-
-    # Inventory lifecycle logic
     carryover = 0.0
     rows = []
     for yr in range(10):
-        planned_prod = sales[yr + 1] if yr < 9 else 0.0
+        planned_prod = sales[yr + 1] if yr < 9 else 0.0  # planned production = next year sales
         new_prod = planned_prod * float(yield_mean) * float(conv_mean)
         prod_loss = new_prod * 0.02
         carry_loss = carryover * 0.10
@@ -341,17 +326,11 @@ if not uploaded:
 dfs = load_workbook(uploaded)
 conv_tab, yield_tab, sales_raw = load_required_sheets(uploaded)
 
-required = ["Product parameters", "Production yields", "Conversion rates", "Sales volume parameters"]
-missing = [s for s in required if s not in dfs and s != "Sales volume parameters"]
-if "Product parameters" not in dfs:
-    st.error("Sheet 'Product parameters' not found. Upload the correct workbook.")
-    st.stop()
-if "Production yields" not in dfs:
-    st.error("Sheet 'Production yields' not found. Upload the correct workbook.")
-    st.stop()
-if "Conversion rates" not in dfs:
-    st.error("Sheet 'Conversion rates' not found. Upload the correct workbook.")
-    st.stop()
+# Validate required sheets for other tabs
+for sname in ["Product parameters", "Production yields", "Conversion rates"]:
+    if sname not in dfs:
+        st.error(f"Sheet '{sname}' not found. Upload the correct workbook.")
+        st.stop()
 
 yield_mean, conv_mean = compute_yield_and_conv_means(conv_tab, yield_tab)
 
@@ -363,10 +342,19 @@ k3.metric("Sheets found", str(len(dfs)))
 tabs = st.tabs(["Maturity distribution", "Production volume", "Inventory lifecycle"])
 
 # ----------------------------
-# Tab 1
+# Tab 1: Maturity distribution
 # ----------------------------
 with tabs[0]:
     df = dfs["Product parameters"].copy()
+
+    # Normalize column names if needed
+    if "Trait" not in df.columns:
+        trait = [c for c in df.columns if "trait" in c.lower()]
+        if trait: df = df.rename(columns={trait[0]: "Trait"})
+    if "Maturity" not in df.columns:
+        mat = [c for c in df.columns if "maturity" in c.lower()]
+        if mat: df = df.rename(columns={mat[0]: "Maturity"})
+
     df["Trait"] = df["Trait"].astype(str).str.strip()
     df["Maturity"] = pd.to_numeric(df["Maturity"], errors="coerce")
     if "Archetype" in df.columns:
@@ -447,7 +435,7 @@ with tabs[0]:
         st.info("No 'Archetype' column found in Product parameters; skipping Archetype view.")
 
 # ----------------------------
-# Tab 2
+# Tab 2: Production volume
 # ----------------------------
 with tabs[1]:
     master = build_master_for_production(dfs)
@@ -515,7 +503,7 @@ with tabs[1]:
             st.plotly_chart(fig2, use_container_width=True)
 
 # ----------------------------
-# Tab 3
+# Tab 3: Inventory lifecycle
 # ----------------------------
 with tabs[2]:
     st.subheader("Inventory lifecycle (Sales + Remaining inventory)")
