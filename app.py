@@ -7,7 +7,16 @@ import plotly.express as px
 st.set_page_config(page_title="Lifecycle Dashboard", layout="wide")
 
 # =============================
-# HELPERS (same as your notebook)
+# Constants for binning maturity
+# =============================
+MATURITY_BINS   = [0, 85, 95, 105, 115, 999]
+MATURITY_LABELS = ["≤85", "86-95", "96-105", "106-115", "116+"]
+
+def maturity_bin(series: pd.Series) -> pd.Categorical:
+    return pd.cut(series, bins=MATURITY_BINS, labels=MATURITY_LABELS, right=True, include_lowest=True)
+
+# =============================
+# HELPERS (same as your notebook for lifecycle)
 # =============================
 def _scan_row_until_blank(row, start_col):
     end = start_col
@@ -72,11 +81,15 @@ def load_required_sheets(uploaded_file):
 
 @st.cache_data(show_spinner=False)
 def load_product_params(uploaded_file):
-    return pd.read_excel(uploaded_file, sheet_name="Product parameters")
+    df = pd.read_excel(uploaded_file, sheet_name="Product parameters")
+    df.columns = df.columns.astype(str).str.strip()
+    return df
 
 @st.cache_data(show_spinner=False)
 def load_production_yields(uploaded_file):
-    return pd.read_excel(uploaded_file, sheet_name="Production yields")
+    df = pd.read_excel(uploaded_file, sheet_name="Production yields")
+    df.columns = df.columns.astype(str).str.strip()
+    return df
 
 # =============================
 # Parse Sales volume parameters (EXACT notebook logic)
@@ -146,7 +159,7 @@ def parse_sales_volume_parameters(sales_raw: pd.DataFrame):
 # Lifecycle logic (same)
 # =============================
 def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map, years_needed, yield_mean, conv_mean):
-    # lookup median sales
+    # median sales lookup
     row = median_sales_df[median_sales_df["Archetype"] == archetype]
     if row.empty:
         return None, None, None
@@ -155,7 +168,7 @@ def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map
         return None, None, None
     y1 = float(val.iloc[0])
 
-    # lookup yoy
+    # yoy lookup
     rowg = growth_df[(growth_df["Archetype"] == archetype) & (growth_df["Maturity"] == maturity)]
     if rowg.empty:
         return None, None, None
@@ -216,6 +229,49 @@ def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map
     return cols, sales[:10], lifecycle_df
 
 # =============================
+# PRODUCTION MASTER (for Production volume tab)
+# =============================
+def build_master_for_production(prod: pd.DataFrame, pp: pd.DataFrame) -> pd.DataFrame:
+    # Normalize likely column names in Product parameters
+    if "Parent0" not in pp.columns:
+        cand = [c for c in pp.columns if "parent" in str(c).lower()]
+        if cand:
+            pp = pp.rename(columns={cand[0]: "Parent0"})
+    if "Trait" not in pp.columns:
+        cand = [c for c in pp.columns if "trait" in str(c).lower()]
+        if cand:
+            pp = pp.rename(columns={cand[0]: "Trait"})
+    if "Maturity" not in pp.columns:
+        cand = [c for c in pp.columns if "maturity" in str(c).lower()]
+        if cand:
+            pp = pp.rename(columns={cand[0]: "Maturity"})
+
+    pp["Trait"] = pp["Trait"].astype(str).str.strip()
+    pp["Maturity"] = pd.to_numeric(pp["Maturity"], errors="coerce")
+    if "Archetype" in pp.columns:
+        pp["Archetype"] = pp["Archetype"].astype(str).str.strip()
+
+    # Numeric in production yields
+    for c in ["Qactual (bu)", "Actual yield", "area (ac)"]:
+        if c in prod.columns:
+            prod[c] = pd.to_numeric(prod[c], errors="coerce")
+
+    keep_cols = ["Parent0", "Trait", "Maturity"] + (["Archetype"] if "Archetype" in pp.columns else [])
+    master = prod.merge(pp[keep_cols], on="Parent0", how="left")
+
+    # Production volume
+    if "Qactual (bu)" in master.columns and master["Qactual (bu)"].notna().sum() > 0:
+        master["Production_Volume"] = master["Qactual (bu)"]
+    elif "area (ac)" in master.columns and "Actual yield" in master.columns:
+        master["Production_Volume"] = master["area (ac)"] * master["Actual yield"]
+    else:
+        master["Production_Volume"] = np.nan
+
+    master = master[master["Production_Volume"].notna()].copy()
+    master["Maturity_Bin"] = maturity_bin(master["Maturity"])
+    return master
+
+# =============================
 # UI
 # =============================
 st.title("📊 Lifecycle Dashboard")
@@ -240,12 +296,184 @@ k1, k2 = st.columns(2)
 k1.metric("Yield factor (mean)", f"{yield_mean:.4f}")
 k2.metric("Conversion rate (mean)", f"{conv_mean:.4f}")
 
-tabs = st.tabs(["Inventory lifecycle", "Maturity distribution", "Production volume"])
+tabs = st.tabs(["Maturity distribution", "Production volume", "Inventory lifecycle"])
 
 # =============================
-# TAB: Inventory lifecycle (main)
+# TAB: Maturity distribution (nice charts)
 # =============================
 with tabs[0]:
+    st.subheader("Maturity distribution")
+
+    pp = load_product_params(uploaded)
+
+    # Normalize columns if needed
+    if "Trait" not in pp.columns:
+        cand = [c for c in pp.columns if "trait" in str(c).lower()]
+        if cand: pp = pp.rename(columns={cand[0]: "Trait"})
+    if "Maturity" not in pp.columns:
+        cand = [c for c in pp.columns if "maturity" in str(c).lower()]
+        if cand: pp = pp.rename(columns={cand[0]: "Maturity"})
+
+    pp["Trait"] = pp["Trait"].astype(str).str.strip()
+    pp["Maturity"] = pd.to_numeric(pp["Maturity"], errors="coerce")
+    if "Archetype" in pp.columns:
+        pp["Archetype"] = pp["Archetype"].astype(str).str.strip()
+
+    pp["Maturity_Bin"] = maturity_bin(pp["Maturity"])
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("### All Traits (stacked)")
+        pivot = (
+            pp.groupby(["Trait", "Maturity_Bin"], observed=False)
+              .size()
+              .reset_index(name="Count")
+        )
+        fig = px.bar(
+            pivot,
+            x="Trait",
+            y="Count",
+            color="Maturity_Bin",
+            barmode="stack",
+            category_orders={"Maturity_Bin": MATURITY_LABELS},
+            height=520,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        st.markdown("### Top N Traits (stacked)")
+        top_n = st.slider("Top N traits", 5, 50, 15, 1)
+        top_traits = (
+            pp.groupby("Trait", observed=False)
+              .size()
+              .sort_values(ascending=False)
+              .head(top_n)
+              .index.tolist()
+        )
+        pivot_top = (
+            pp[pp["Trait"].isin(top_traits)]
+            .groupby(["Trait", "Maturity_Bin"], observed=False)
+            .size()
+            .reset_index(name="Count")
+        )
+        fig2 = px.bar(
+            pivot_top,
+            x="Trait",
+            y="Count",
+            color="Maturity_Bin",
+            barmode="stack",
+            category_orders={"Trait": top_traits, "Maturity_Bin": MATURITY_LABELS},
+            height=520,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    if "Archetype" in pp.columns:
+        st.markdown("---")
+        st.markdown("### By Archetype")
+        arch = st.selectbox("Select archetype", sorted(pp["Archetype"].dropna().unique().tolist()))
+        sub = pp[pp["Archetype"] == arch].copy()
+
+        pivot_arch = (
+            sub.groupby(["Trait", "Maturity_Bin"], observed=False)
+               .size()
+               .reset_index(name="Count")
+        )
+        fig3 = px.bar(
+            pivot_arch,
+            x="Trait",
+            y="Count",
+            color="Maturity_Bin",
+            barmode="stack",
+            category_orders={"Maturity_Bin": MATURITY_LABELS},
+            height=520,
+            title=f"Maturity distribution — {arch}",
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+    else:
+        st.info("No 'Archetype' column found in Product parameters; skipping Archetype view.")
+
+# =============================
+# TAB: Production volume (nice charts)
+# =============================
+with tabs[1]:
+    st.subheader("Production volume")
+
+    prod = load_production_yields(uploaded)
+    pp = load_product_params(uploaded)
+
+    try:
+        master = build_master_for_production(prod, pp)
+    except Exception as e:
+        st.error(f"Could not build production master table: {e}")
+        st.stop()
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown("### Trait × Maturity bin")
+        agg_trait = (
+            master.groupby(["Trait", "Maturity_Bin"], observed=False)["Production_Volume"]
+                  .sum()
+                  .reset_index()
+        )
+
+        trait_list = sorted(agg_trait["Trait"].dropna().unique().tolist())
+        trait = st.selectbox("Trait", trait_list)
+
+        bin_choice = st.selectbox("Maturity bin", ["All"] + MATURITY_LABELS)
+
+        dfp = agg_trait[agg_trait["Trait"] == trait].copy()
+        if bin_choice != "All":
+            dfp = dfp[dfp["Maturity_Bin"] == bin_choice]
+
+        fig = px.bar(
+            dfp,
+            x="Maturity_Bin",
+            y="Production_Volume",
+            color="Maturity_Bin" if bin_choice == "All" else None,
+            category_orders={"Maturity_Bin": MATURITY_LABELS},
+            height=520,
+            title=f"Production Volume — Trait: {trait}",
+        )
+        fig.update_layout(xaxis_title="Maturity Bin", yaxis_title="Total Production Volume (bu)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with colB:
+        st.markdown("### Archetype × Maturity bin")
+        if "Archetype" not in master.columns:
+            st.info("No 'Archetype' column found in Product parameters; skipping Archetype chart.")
+        else:
+            agg_arch = (
+                master.groupby(["Archetype", "Maturity_Bin"], observed=False)["Production_Volume"]
+                      .sum()
+                      .reset_index()
+            )
+            arch_list = sorted(agg_arch["Archetype"].dropna().unique().tolist())
+            arch = st.selectbox("Archetype", arch_list)
+
+            bin_choice2 = st.selectbox("Maturity bin (Archetype)", ["All"] + MATURITY_LABELS)
+
+            dfp2 = agg_arch[agg_arch["Archetype"] == arch].copy()
+            if bin_choice2 != "All":
+                dfp2 = dfp2[dfp2["Maturity_Bin"] == bin_choice2]
+
+            fig2 = px.bar(
+                dfp2,
+                x="Maturity_Bin",
+                y="Production_Volume",
+                color="Maturity_Bin" if bin_choice2 == "All" else None,
+                category_orders={"Maturity_Bin": MATURITY_LABELS},
+                height=520,
+                title=f"Production Volume — Archetype: {arch}",
+            )
+            fig2.update_layout(xaxis_title="Maturity Bin", yaxis_title="Total Production Volume (bu)")
+            st.plotly_chart(fig2, use_container_width=True)
+
+# =============================
+# TAB: Inventory lifecycle (unchanged working logic)
+# =============================
+with tabs[2]:
     st.subheader("Inventory lifecycle (Sales + Remaining inventory)")
 
     try:
@@ -279,75 +507,3 @@ with tabs[0]:
                 height=520
             )
             st.plotly_chart(fig, use_container_width=True)
-
-# =============================
-# TAB: Maturity distribution (simple)
-# =============================
-with tabs[1]:
-    st.subheader("Maturity distribution")
-    try:
-        pp = load_product_params(uploaded)
-        if "Trait" in pp.columns and "Maturity" in pp.columns:
-            pp["Trait"] = pp["Trait"].astype(str).str.strip()
-            pp["Maturity"] = pd.to_numeric(pp["Maturity"], errors="coerce")
-            # bins
-            bins = [0, 85, 95, 105, 115, 999]
-            labels = ["≤85", "86-95", "96-105", "106-115", "116+"]
-            pp["Maturity_Bin"] = pd.cut(pp["Maturity"], bins=bins, labels=labels, include_lowest=True)
-
-            pivot = pp.groupby(["Trait", "Maturity_Bin"], observed=False).size().reset_index(name="Count")
-            fig = px.bar(pivot, x="Trait", y="Count", color="Maturity_Bin", barmode="stack")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Product parameters sheet missing Trait/Maturity columns.")
-    except Exception as e:
-        st.info(f"Could not render maturity distribution: {e}")
-
-# =============================
-# TAB: Production volume (simple)
-# =============================
-with tabs[2]:
-    st.subheader("Production volume")
-    try:
-        prod = load_production_yields(uploaded)
-        pp = load_product_params(uploaded)
-
-        # normalize likely columns
-        if "Parent0" not in pp.columns:
-            cand = [c for c in pp.columns if "parent" in str(c).lower()]
-            if cand: pp = pp.rename(columns={cand[0]: "Parent0"})
-        if "Trait" not in pp.columns:
-            cand = [c for c in pp.columns if "trait" in str(c).lower()]
-            if cand: pp = pp.rename(columns={cand[0]: "Trait"})
-        if "Maturity" not in pp.columns:
-            cand = [c for c in pp.columns if "maturity" in str(c).lower()]
-            if cand: pp = pp.rename(columns={cand[0]: "Maturity"})
-
-        pp["Maturity"] = pd.to_numeric(pp["Maturity"], errors="coerce")
-        pp["Trait"] = pp["Trait"].astype(str).str.strip()
-
-        for c in ["Qactual (bu)", "Actual yield", "area (ac)"]:
-            if c in prod.columns:
-                prod[c] = pd.to_numeric(prod[c], errors="coerce")
-
-        master = prod.merge(pp[["Parent0", "Trait", "Maturity"]], on="Parent0", how="left")
-        if "Qactual (bu)" in master.columns and master["Qactual (bu)"].notna().sum() > 0:
-            master["Production_Volume"] = master["Qactual (bu)"]
-        elif "area (ac)" in master.columns and "Actual yield" in master.columns:
-            master["Production_Volume"] = master["area (ac)"] * master["Actual yield"]
-        else:
-            master["Production_Volume"] = np.nan
-
-        master = master[master["Production_Volume"].notna()].copy()
-        bins = [0, 85, 95, 105, 115, 999]
-        labels = ["≤85", "86-95", "96-105", "106-115", "116+"]
-        master["Maturity_Bin"] = pd.cut(master["Maturity"], bins=bins, labels=labels, include_lowest=True)
-
-        agg = master.groupby(["Trait", "Maturity_Bin"], observed=False)["Production_Volume"].sum().reset_index()
-        trait = st.selectbox("Trait", sorted(agg["Trait"].dropna().unique()))
-        dfp = agg[agg["Trait"] == trait]
-
-        fig = px.bar(dfp, x="Maturity_Bin", y="Production_Volume", color="Maturity_Bin")
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception as e:
-        st.info(f"Could not render production volume: {e}")
