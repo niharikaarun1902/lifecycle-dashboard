@@ -69,15 +69,16 @@ def _to_rate(x):
 # =============================
 @st.cache_data(show_spinner=False)
 def load_required_sheets(uploaded_file):
-    conv_tab  = pd.read_excel(uploaded_file, sheet_name="Conversion rates")
-    yield_tab = pd.read_excel(uploaded_file, sheet_name="Production yields")
-    sales_raw = pd.read_excel(uploaded_file, sheet_name="Sales volume parameters", header=None)
+    conv_tab   = pd.read_excel(uploaded_file, sheet_name="Conversion rates")
+    yield_tab  = pd.read_excel(uploaded_file, sheet_name="Production yields")
+    params_tab = pd.read_excel(uploaded_file, sheet_name="Product parameters")
+    sales_raw  = pd.read_excel(uploaded_file, sheet_name="Sales volume parameters", header=None)
 
     # clean col names like notebook
-    for df_ in [conv_tab, yield_tab]:
+    for df_ in [conv_tab, yield_tab, params_tab]:
         df_.columns = df_.columns.astype(str).str.strip()
 
-    return conv_tab, yield_tab, sales_raw
+    return conv_tab, yield_tab, params_tab, sales_raw
 
 @st.cache_data(show_spinner=False)
 def load_product_params(uploaded_file):
@@ -92,7 +93,7 @@ def load_production_yields(uploaded_file):
     return df
 
 # =============================
-# Parse Sales volume parameters (EXACT notebook logic)
+# Parse Sales volume parameters (EXACT notebook logic you had working)
 # =============================
 def parse_sales_volume_parameters(sales_raw: pd.DataFrame):
     # 1) MEDIAN FIRST YEAR SALES TABLE (LEFT BLOCK)
@@ -156,27 +157,81 @@ def parse_sales_volume_parameters(sales_raw: pd.DataFrame):
     return median_sales_df, growth_df, year_map, years_needed, needed_maturities
 
 # =============================
-# Lifecycle logic (same)
+# ✅ NEW: archetype-specific yield + conversion (ONLY CHANGE)
 # =============================
-def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map, years_needed, yield_mean, conv_mean):
+def prep_yield_conv_with_archetype(conv_tab, yield_tab, params_tab):
+    # mapping Parent0 -> Archetype
+    if "Parent0" not in params_tab.columns or "Archetype" not in params_tab.columns:
+        raise ValueError("Product parameters must contain columns: Parent0, Archetype")
+
+    params_tab = params_tab.copy()
+    params_tab["Parent0"] = params_tab["Parent0"].astype(str).str.strip()
+    params_tab["Archetype"] = params_tab["Archetype"].astype(str).str.strip()
+    parent_to_arch = params_tab[["Parent0", "Archetype"]].dropna()
+
+    # Yield_Factor per Parent0
+    for col in ["Parent0", "Planned yield (bu/ac)", "Actual yield"]:
+        if col not in yield_tab.columns:
+            raise ValueError(f"Production yields sheet missing column: {col}")
+
+    y = yield_tab.copy()
+    y["Parent0"] = y["Parent0"].astype(str).str.strip()
+    y["Planned yield (bu/ac)"] = pd.to_numeric(y["Planned yield (bu/ac)"], errors="coerce")
+    y["Actual yield"] = pd.to_numeric(y["Actual yield"], errors="coerce")
+    y["Yield_Factor"] = y["Actual yield"] / y["Planned yield (bu/ac)"]
+    y["Yield_Factor"] = y["Yield_Factor"].replace([np.inf, -np.inf], np.nan)
+    yield_w_arch = y.merge(parent_to_arch, on="Parent0", how="left")
+
+    # Conversion per Parent0
+    for col in ["Parent0", "totalConversionRate"]:
+        if col not in conv_tab.columns:
+            raise ValueError(f"Conversion rates sheet missing column: {col}")
+
+    c = conv_tab.copy()
+    c["Parent0"] = c["Parent0"].astype(str).str.strip()
+    c["totalConversionRate"] = pd.to_numeric(c["totalConversionRate"], errors="coerce")
+    conv_w_arch = c.merge(parent_to_arch, on="Parent0", how="left")
+
+    # overall fallback means
+    fallback_y = float(yield_w_arch["Yield_Factor"].dropna().mean())
+    fallback_c = float(conv_w_arch["totalConversionRate"].dropna().mean())
+
+    return yield_w_arch, conv_w_arch, fallback_y, fallback_c
+
+def get_archetype_means(archetype, yield_w_arch, conv_w_arch, fallback_y, fallback_c):
+    y = yield_w_arch.loc[yield_w_arch["Archetype"] == archetype, "Yield_Factor"].dropna()
+    c = conv_w_arch.loc[conv_w_arch["Archetype"] == archetype, "totalConversionRate"].dropna()
+
+    y_mean = float(y.mean()) if len(y) else float(fallback_y)
+    c_mean = float(c.mean()) if len(c) else float(fallback_c)
+    return y_mean, c_mean
+
+# =============================
+# Lifecycle logic (same except uses archetype y_mean/c_mean)
+# =============================
+def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map, years_needed,
+                      yield_w_arch, conv_w_arch, fallback_y, fallback_c):
     # median sales lookup
     row = median_sales_df[median_sales_df["Archetype"] == archetype]
     if row.empty:
-        return None, None, None
+        return None, None, None, None, None
     val = row[maturity].dropna()
     if val.empty:
-        return None, None, None
+        return None, None, None, None, None
     y1 = float(val.iloc[0])
 
     # yoy lookup
     rowg = growth_df[(growth_df["Archetype"] == archetype) & (growth_df["Maturity"] == maturity)]
     if rowg.empty:
-        return None, None, None
+        return None, None, None, None, None
 
     yoy = []
     for y in years_needed:
         raw = rowg[year_map[y]].iloc[0] if y in year_map else np.nan
         yoy.append(_to_rate(raw))
+
+    # ✅ archetype-specific yield/conv (ONLY CHANGE)
+    y_mean, c_mean = get_archetype_means(archetype, yield_w_arch, conv_w_arch, fallback_y, fallback_c)
 
     # Sales Year1..Year10
     sales = [y1]
@@ -191,7 +246,7 @@ def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map
     rows = []
     for yr in range(10):
         planned_prod = sales[yr + 1] if yr < 9 else 0.0  # planned = next yr sales
-        new_prod = planned_prod * yield_mean * conv_mean
+        new_prod = planned_prod * y_mean * c_mean
         prod_loss = new_prod * 0.02
         carry_loss = carryover * 0.10
 
@@ -226,13 +281,12 @@ def build_lifecycle_df(archetype, maturity, median_sales_df, growth_df, year_map
         ]
     )
 
-    return cols, sales[:10], lifecycle_df
+    return cols, sales[:10], lifecycle_df, y_mean, c_mean
 
 # =============================
-# PRODUCTION MASTER (for Production volume tab)
+# PRODUCTION MASTER (unchanged)
 # =============================
 def build_master_for_production(prod: pd.DataFrame, pp: pd.DataFrame) -> pd.DataFrame:
-    # Normalize likely column names in Product parameters
     if "Parent0" not in pp.columns:
         cand = [c for c in pp.columns if "parent" in str(c).lower()]
         if cand:
@@ -251,7 +305,6 @@ def build_master_for_production(prod: pd.DataFrame, pp: pd.DataFrame) -> pd.Data
     if "Archetype" in pp.columns:
         pp["Archetype"] = pp["Archetype"].astype(str).str.strip()
 
-    # Numeric in production yields
     for c in ["Qactual (bu)", "Actual yield", "area (ac)"]:
         if c in prod.columns:
             prod[c] = pd.to_numeric(prod[c], errors="coerce")
@@ -259,7 +312,6 @@ def build_master_for_production(prod: pd.DataFrame, pp: pd.DataFrame) -> pd.Data
     keep_cols = ["Parent0", "Trait", "Maturity"] + (["Archetype"] if "Archetype" in pp.columns else [])
     master = prod.merge(pp[keep_cols], on="Parent0", how="left")
 
-    # Production volume
     if "Qactual (bu)" in master.columns and master["Qactual (bu)"].notna().sum() > 0:
         master["Production_Volume"] = master["Qactual (bu)"]
     elif "area (ac)" in master.columns and "Actual yield" in master.columns:
@@ -281,32 +333,26 @@ if not uploaded:
     st.info("Upload your Excel file to begin.")
     st.stop()
 
-conv_tab, yield_tab, sales_raw = load_required_sheets(uploaded)
+conv_tab, yield_tab, params_tab, sales_raw = load_required_sheets(uploaded)
 
-# Means (same)
-yield_tab["Planned yield (bu/ac)"] = pd.to_numeric(yield_tab["Planned yield (bu/ac)"], errors="coerce")
-yield_tab["Actual yield"] = pd.to_numeric(yield_tab["Actual yield"], errors="coerce")
-yield_tab["Yield_Factor"] = yield_tab["Actual yield"] / yield_tab["Planned yield (bu/ac)"]
-yield_mean = yield_tab["Yield_Factor"].replace([np.inf, -np.inf], np.nan).mean()
+# ✅ NEW: prep archetype-specific yield & conversion
+yield_w_arch, conv_w_arch, fallback_y, fallback_c = prep_yield_conv_with_archetype(conv_tab, yield_tab, params_tab)
 
-conv_tab["totalConversionRate"] = pd.to_numeric(conv_tab["totalConversionRate"], errors="coerce")
-conv_mean = conv_tab["totalConversionRate"].mean()
-
+# top KPI cards (overall fallback means)
 k1, k2 = st.columns(2)
-k1.metric("Yield factor (mean)", f"{yield_mean:.4f}")
-k2.metric("Conversion rate (mean)", f"{conv_mean:.4f}")
+k1.metric("Yield factor (overall mean)", f"{fallback_y:.4f}" if pd.notna(fallback_y) else "NA")
+k2.metric("Conversion rate (overall mean)", f"{fallback_c:.4f}" if pd.notna(fallback_c) else "NA")
 
 tabs = st.tabs(["Maturity distribution", "Production volume", "Inventory lifecycle"])
 
 # =============================
-# TAB: Maturity distribution (nice charts)
+# TAB: Maturity distribution (same nice charts)
 # =============================
 with tabs[0]:
     st.subheader("Maturity distribution")
 
     pp = load_product_params(uploaded)
 
-    # Normalize columns if needed
     if "Trait" not in pp.columns:
         cand = [c for c in pp.columns if "trait" in str(c).lower()]
         if cand: pp = pp.rename(columns={cand[0]: "Trait"})
@@ -394,7 +440,7 @@ with tabs[0]:
         st.info("No 'Archetype' column found in Product parameters; skipping Archetype view.")
 
 # =============================
-# TAB: Production volume (nice charts)
+# TAB: Production volume (same nice charts)
 # =============================
 with tabs[1]:
     st.subheader("Production volume")
@@ -471,7 +517,7 @@ with tabs[1]:
             st.plotly_chart(fig2, use_container_width=True)
 
 # =============================
-# TAB: Inventory lifecycle (unchanged working logic)
+# TAB: Inventory lifecycle (same working logic + ONLY yield/conv changed)
 # =============================
 with tabs[2]:
     st.subheader("Inventory lifecycle (Sales + Remaining inventory)")
@@ -487,12 +533,15 @@ with tabs[2]:
     mat = st.selectbox("Maturity", maturities)
 
     if st.button("Build lifecycle"):
-        cols, sales, lifecycle_df = build_lifecycle_df(
-            arch, mat, median_sales_df, growth_df, year_map, years_needed, yield_mean, conv_mean
+        cols, sales, lifecycle_df, y_mean, c_mean = build_lifecycle_df(
+            arch, mat, median_sales_df, growth_df, year_map, years_needed,
+            yield_w_arch, conv_w_arch, fallback_y, fallback_c
         )
         if lifecycle_df is None:
             st.warning("No data found for this Archetype + Maturity combination.")
         else:
+            st.info(f"Using Archetype-specific means → Yield: {y_mean:.4f} | Conversion: {c_mean:.4f}")
+
             st.dataframe(lifecycle_df.round(1), use_container_width=True)
 
             remaining = lifecycle_df.loc["Remaining inventory (carryover out)"].astype(float).values
@@ -501,7 +550,7 @@ with tabs[2]:
             fig.add_trace(go.Scatter(x=cols, y=sales, mode="lines+markers", name="Sales"))
             fig.add_trace(go.Scatter(x=cols, y=remaining, mode="lines+markers", name="Remaining inventory"))
             fig.update_layout(
-                title=f"Inventory Lifecycle – {arch} | Maturity {mat}",
+                title=f"Inventory Lifecycle – {arch} | Maturity {mat} (Archetype-specific Yield & Conv)",
                 xaxis_title="Year",
                 yaxis_title="Volume",
                 height=520
