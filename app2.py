@@ -1,47 +1,106 @@
 # app.py
-# Streamlit app to demo your lifecycle model (Sales curve + Inventory simulation)
-# with archetype-specific Yield Factor + Conversion Rate means, parsed from the
-# report-style "Sales volume parameters" sheet.
+# Streamlit "Explain What I Did" Visual App
+# - Shows a visual pipeline (flowchart)
+# - Shows extracted inputs (Median Year-1 sales + Median growth rates)
+# - Shows archetype-specific Yield Factor + Conversion Rate assumptions
+# - Shows Sales curve build (YoY compounding) + Inventory simulation
+# - Shows outputs as charts + table
+#
+# Run:
+#   streamlit run app.py
+#
+# Note:
+#   This app expects your Excel to have sheets:
+#   - "Conversion rates" with columns: Parent0, totalConversionRate
+#   - "Production yields" with columns: Parent0, Planned yield (bu/ac), Actual yield
+#   - "Product parameters" with columns: Parent0, Archetype
+#   - "Sales volume parameters" report-style sheet (loaded header=None)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Lifecycle Simulator", layout="wide")
+st.set_page_config(page_title="Lifecycle Model – What I Did (Visual)", layout="wide")
 
-# -----------------------------
-# Helpers: small UI
-# -----------------------------
-def banner():
-    st.title("📈 Inventory Lifecycle Simulator")
-    st.caption(
-        "Loads your Excel, extracts Median Year-1 Sales + Median Growth Rates (Years 2–10), "
-        "computes archetype-specific Yield Factor and Conversion Rate means, then simulates "
-        "10-year sales + inventory carryover."
-    )
+# =============================
+# Visual helpers
+# =============================
+def show_pipeline_flow():
+    st.subheader("1) Visual pipeline (what I built)")
+    st.caption("This is the end-to-end flow of the cell — from Excel sheets → extracted inputs → simulation → outputs.")
 
-def info_box():
-    with st.expander("What this app is doing (high-level)", expanded=False):
+    # Simple flow diagram using Mermaid-like style via markdown
+    # (Streamlit doesn't natively render Mermaid; we use a clean ASCII + sections.)
+    col1, col2 = st.columns([1, 1.3], gap="large")
+    with col1:
         st.markdown(
             """
-**Pipeline**
-1) Load sheets: Conversion rates, Production yields, Product parameters, Sales volume parameters  
-2) Map `Parent0 → Archetype` (from Product parameters)  
-3) Compute `Yield_Factor = Actual yield / Planned yield (bu/ac)` and attach archetype  
-4) Attach archetype to conversion rates (`totalConversionRate`)  
-5) Parse report-style Sales sheet to extract:
-   - Median first-year sales (Year 1 baseline) by Archetype & Maturity (85/95/105/115)
-   - Median YoY growth rates (Years 2–10) by Archetype & Maturity  
-6) Build Sales curve (Year1..Year10) by compounding YoY rates  
-7) Run inventory logic (planned production = next year sales) with 2% production loss + 10% carryover loss  
-8) Show table + plots
-"""
+**Inputs (Excel tabs)**
+- Product parameters → `Parent0 → Archetype`
+- Production yields → `Yield_Factor`
+- Conversion rates → `totalConversionRate`
+- Sales volume parameters → Median **Year-1 Sales** + Median **YoY Growth Rates**
+
+**Core transformations**
+- Clean keys (`Parent0`) and numeric types
+- Merge archetype onto yield + conversion
+- Parse report-style sales sheet into clean tables
+- Build 10-year sales curve (compounding YoY)
+- Simulate inventory lifecycle with losses
+
+**Outputs**
+- Lifecycle table (Year 1…10)
+- Sales vs Remaining Inventory plot
+            """
         )
 
-# -----------------------------
-# Helpers: parsing report-style sheet
-# -----------------------------
+    with col2:
+        # A more "visual" pipeline using Plotly shapes (looks like a flowchart)
+        fig = go.Figure()
+        fig.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+        )
+
+        boxes = [
+            ("Excel Sheets", 0.05, 0.65),
+            ("Clean + Merge\n(Parent0→Archetype)", 0.27, 0.65),
+            ("Extract Sales Inputs\n(Year1 + YoY 2..10)", 0.49, 0.65),
+            ("Build Sales Curve\n(compound YoY)", 0.71, 0.65),
+            ("Inventory Simulation\n(losses + carryover)", 0.82, 0.25),
+            ("Outputs\n(table + plots)", 0.49, 0.25),
+        ]
+
+        for text, x, y in boxes:
+            fig.add_shape(
+                type="rect",
+                x0=x, y0=y, x1=x + 0.18, y1=y + 0.22,
+                line=dict(width=1),
+                fillcolor="rgba(200,200,200,0.15)",
+            )
+            fig.add_annotation(x=x + 0.09, y=y + 0.11, text=text, showarrow=False, font=dict(size=12))
+
+        arrows = [
+            ((0.23, 0.76), (0.27, 0.76)),
+            ((0.45, 0.76), (0.49, 0.76)),
+            ((0.67, 0.76), (0.71, 0.76)),
+            ((0.80, 0.65), (0.86, 0.47)),
+            ((0.71, 0.25), (0.67, 0.25)),
+            ((0.49, 0.47), (0.49, 0.40)),
+        ]
+        for (x0, y0), (x1, y1) in arrows:
+            fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, xref="paper", yref="paper",
+                               axref="paper", ayref="paper", showarrow=True, arrowhead=3)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# =============================
+# Parsing helpers (Sales volume parameters)
+# =============================
 def norm_txt(x):
     if pd.isna(x):
         return ""
@@ -75,7 +134,7 @@ def is_bad_archetype(x):
         "average first year sales volumes",
         "median growth rates",
         "average growth rates",
-        "relative sales year"
+        "relative sales year",
     ]
     return any(b in t for b in bad)
 
@@ -89,7 +148,7 @@ def normalize_numeric_cols(cols):
     return m
 
 def to_rate(x):
-    """Convert growth cell to decimal rate."""
+    # Convert growth cell to decimal rate.
     if pd.isna(x):
         return 0.0
     if isinstance(x, str):
@@ -104,20 +163,13 @@ def to_rate(x):
         v = float(v)
     else:
         v = float(x)
-    # if looks like percent (e.g., 51.3), scale down
     return v / 100.0 if abs(v) > 2 else v
 
-def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
-    """
-    Returns:
-      median_sales_df: columns ['Archetype', 85, 95, 105, 115]
-      growth_df: columns include ['Archetype', 'Maturity', <year columns>]
-      year_map: dict mapping int year -> actual column label in growth_df
-    """
-    # 1) Median first year sales
+def extract_sales_inputs(sales_raw: pd.DataFrame):
+    # --- Median first-year sales ---
     anchor = find_cell(sales_raw, "Median first year sales volumes")
     if anchor is None:
-        raise ValueError("Couldn't find 'Median first year sales volumes' block in Sales volume parameters.")
+        raise ValueError("Couldn't find 'Median first year sales volumes' block.")
     anchor_r, _ = anchor
 
     median_header_r = None
@@ -126,7 +178,7 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
             median_header_r = r
             break
     if median_header_r is None:
-        raise ValueError("Couldn't locate 'Archetype' header row for the Median first year sales block.")
+        raise ValueError("Couldn't find 'Archetype' header for Median first year sales block.")
 
     median_start_c = 0
     median_end_c = scan_row_until_blank(sales_raw, median_header_r, median_start_c)
@@ -135,7 +187,7 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
     median_df.columns = sales_raw.iloc[median_header_r, median_start_c:median_end_c].values
 
     if "Archetype" not in median_df.columns:
-        raise ValueError("Median sales block parse failed: 'Archetype' column not found after header assignment.")
+        raise ValueError("Median sales parse failed: 'Archetype' column not found.")
 
     median_df = median_df.dropna(subset=["Archetype"])
     median_df["Archetype"] = clean_series(median_df["Archetype"])
@@ -153,9 +205,7 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
     needed_maturities = [85, 95, 105, 115]
     missing = [m for m in needed_maturities if m not in maturity_cols_map]
     if missing:
-        raise ValueError(
-            f"Missing maturity columns {missing} in median sales block. Found maturities: {sorted(maturity_cols_map.keys())}"
-        )
+        raise ValueError(f"Missing maturity cols {missing} in median sales block. Found: {sorted(maturity_cols_map.keys())}")
 
     median_sales_df = median_df[["Archetype"] + [maturity_cols_map[m] for m in needed_maturities]].copy()
     median_sales_df.columns = ["Archetype"] + needed_maturities
@@ -163,15 +213,14 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
         median_sales_df[m] = pd.to_numeric(median_sales_df[m], errors="coerce")
     median_sales_df = median_sales_df.dropna(subset=needed_maturities, how="all")
 
-    # 2) Median growth rates
+    # --- Median growth rates ---
     growth_anchor = find_cell(sales_raw, "Median growth rates")
     if growth_anchor is None:
-        raise ValueError("Couldn't find 'Median growth rates' block in Sales volume parameters.")
+        raise ValueError("Couldn't find 'Median growth rates' block.")
     ga_r, _ = growth_anchor
 
-    growth_header_r = None
-    growth_start_c = None
-    for r in range(ga_r, min(ga_r + 50, sales_raw.shape[0])):
+    growth_header_r, growth_start_c = None, None
+    for r in range(ga_r, min(ga_r + 60, sales_raw.shape[0])):
         for c in range(sales_raw.shape[1] - 1):
             if norm_txt(sales_raw.iat[r, c]) == "archetype" and norm_txt(sales_raw.iat[r, c + 1]) == "maturity":
                 growth_header_r = r
@@ -180,7 +229,7 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
         if growth_header_r is not None:
             break
     if growth_header_r is None:
-        raise ValueError("Couldn't locate 'Archetype' + 'Maturity' header for the Median growth rates block.")
+        raise ValueError("Couldn't find Archetype+Maturity header in Median growth rates block.")
 
     growth_end_c = scan_row_until_blank(sales_raw, growth_header_r, growth_start_c)
 
@@ -188,7 +237,7 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
     growth_df.columns = sales_raw.iloc[growth_header_r, growth_start_c:growth_end_c].values
 
     if "Archetype" not in growth_df.columns or "Maturity" not in growth_df.columns:
-        raise ValueError("Growth block parse failed: 'Archetype'/'Maturity' columns not found.")
+        raise ValueError("Growth rates parse failed: 'Archetype'/'Maturity' not found.")
 
     growth_df = growth_df.dropna(subset=["Archetype", "Maturity"])
     growth_df["Archetype"] = clean_series(growth_df["Archetype"])
@@ -201,15 +250,14 @@ def extract_median_sales_and_growth(sales_raw: pd.DataFrame):
     years_needed = list(range(2, 11))
     missing_years = [y for y in years_needed if y not in year_map]
     if missing_years:
-        raise ValueError(
-            f"Missing growth year columns {missing_years} in Median growth rates block. Found: {sorted(year_map.keys())}"
-        )
+        raise ValueError(f"Missing growth year columns {missing_years}. Found: {sorted(year_map.keys())}")
 
     return median_sales_df, growth_df, year_map
 
-# -----------------------------
-# Lifecycle builder
-# -----------------------------
+
+# =============================
+# Model builders
+# =============================
 def build_sales_curve(y1: float, yoy_rates: list[float]):
     sales = [float(y1)]
     for r in yoy_rates:  # Year2..Year10
@@ -217,9 +265,9 @@ def build_sales_curve(y1: float, yoy_rates: list[float]):
         if nxt < 0:
             nxt = 0.0
         sales.append(nxt)
-    return sales  # length 10
+    return sales  # len 10
 
-def simulate_inventory(sales: list[float], y_mean: float, c_mean: float, prod_loss_rate=0.02, carry_loss_rate=0.10):
+def simulate_inventory(sales, y_mean, c_mean, prod_loss_rate=0.02, carry_loss_rate=0.10):
     carryover = 0.0
     rows = []
     for yr in range(10):
@@ -227,29 +275,18 @@ def simulate_inventory(sales: list[float], y_mean: float, c_mean: float, prod_lo
         new_prod = planned_prod * y_mean * c_mean
         prod_loss = new_prod * prod_loss_rate
         carry_loss = carryover * carry_loss_rate
-
         total_saleable = (carryover - carry_loss) + (new_prod - prod_loss)
         remaining = total_saleable - sales[yr]
-
-        rows.append([
-            carryover,
-            -carry_loss,
-            planned_prod,
-            new_prod,
-            -prod_loss,
-            total_saleable,
-            sales[yr],
-            remaining
-        ])
+        rows.append([carryover, -carry_loss, planned_prod, new_prod, -prod_loss, total_saleable, sales[yr], remaining])
         carryover = remaining
 
     cols = [f"Year {i}" for i in range(1, 11)]
     idx = [
         "Carryover inventory from prior year",
-        "Carryover quality loss (10%)",
+        "Carryover quality loss",
         "Planned production (= next yr sales)",
         "New production (after yield & conv.)",
-        "Production quality loss (2%)",
+        "Production quality loss",
         "Total saleable inventory",
         "Sales",
         "Remaining inventory (carryover out)"
@@ -257,94 +294,124 @@ def simulate_inventory(sales: list[float], y_mean: float, c_mean: float, prod_lo
     lifecycle_df = pd.DataFrame(np.array(rows).T, columns=cols, index=idx)
     return lifecycle_df
 
-def plot_sales_vs_inventory(sales: list[float], remaining: np.ndarray, title: str):
+def chart_sales_and_inventory(sales, remaining, title):
     cols = [f"Year {i}" for i in range(1, 11)]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=cols, y=sales, mode="lines+markers", name="Sales"))
     fig.add_trace(go.Scatter(x=cols, y=remaining, mode="lines+markers", name="Remaining inventory"))
-    fig.update_layout(title=title, xaxis_title="Year", yaxis_title="Volume", height=520)
+    fig.update_layout(title=title, xaxis_title="Year", yaxis_title="Volume", height=450)
     return fig
 
-# -----------------------------
-# Data loader (cached)
-# -----------------------------
+def chart_sales_build(sales, yoy_rates):
+    # Visualize YoY compounding effect (bar for rates + line for sales)
+    years = [f"Y{i}" for i in range(1, 11)]
+    rates = [None] + yoy_rates  # align: Year1 has no growth rate
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=years, y=sales, mode="lines+markers", name="Sales"))
+    fig.add_trace(go.Bar(x=years[1:], y=yoy_rates, name="YoY rate (decimal)", opacity=0.5))
+    fig.update_layout(
+        title="How the Sales curve was built (Year 1 baseline + YoY compounding)",
+        xaxis_title="Year",
+        yaxis_title="Sales / YoY rate",
+        height=450,
+        barmode="overlay"
+    )
+    return fig
+
+def chart_inventory_waterfall(year_label, carry_in, carry_loss, new_prod, prod_loss, sales):
+    # A waterfall-like bar chart explaining one year’s mechanics
+    # Note: Plotly waterfall exists; we keep it simple and reliable.
+    steps = [
+        ("Carryover in", carry_in),
+        ("Carryover loss", carry_loss),   # negative
+        ("New production", new_prod),
+        ("Production loss", prod_loss),   # negative
+        ("Sales", -sales),                # negative
+    ]
+    x = [s[0] for s in steps]
+    y = [s[1] for s in steps]
+    fig = go.Figure(go.Bar(x=x, y=y))
+    fig.update_layout(
+        title=f"Inventory math breakdown – {year_label}",
+        xaxis_title="Components",
+        yaxis_title="Volume impact (+/-)",
+        height=360
+    )
+    return fig
+
+
+# =============================
+# Caching loader
+# =============================
 @st.cache_data(show_spinner=False)
-def load_workbook(file_bytes: bytes):
-    # Read sheets
+def load_excel(file_bytes: bytes):
     conv_tab = pd.read_excel(file_bytes, sheet_name="Conversion rates")
     yield_tab = pd.read_excel(file_bytes, sheet_name="Production yields")
     params_tab = pd.read_excel(file_bytes, sheet_name="Product parameters")
     sales_raw = pd.read_excel(file_bytes, sheet_name="Sales volume parameters", header=None)
 
-    # Clean column names for structured tables
     for df_ in [conv_tab, yield_tab, params_tab]:
         df_.columns = df_.columns.astype(str).str.strip()
 
     return conv_tab, yield_tab, params_tab, sales_raw
 
-# -----------------------------
-# Main App
-# -----------------------------
-banner()
-info_box()
 
-st.sidebar.header("📦 Input")
+# =============================
+# App UI
+# =============================
+st.title("🎥 Visual Explanation: What I Did in That Cell")
+st.caption("This Streamlit page is designed to *explain* your cell with visuals — not just show results.")
+
 uploaded = st.sidebar.file_uploader("Upload your Excel (.xlsx)", type=["xlsx"])
+if uploaded is None:
+    st.info("Upload your Excel file to start.")
+    show_pipeline_flow()
+    st.stop()
 
-use_default_path = st.sidebar.checkbox("Use Colab path (/content/data (1).xlsx)", value=False)
+conv_tab, yield_tab, params_tab, sales_raw = load_excel(uploaded.getvalue())
 
-file_source = None
-file_bytes = None
+show_pipeline_flow()
 
-if use_default_path:
-    file_source = "path"
-else:
-    file_source = "upload"
+st.divider()
 
-if file_source == "path":
-    st.sidebar.info("Using `/content/data (1).xlsx` (make sure it exists in this environment).")
-    try:
-        # Streamlit runs locally; this will work only if file exists on the same machine.
-        # For most cases, upload is easier.
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-    except Exception as e:
-        st.error(
-            "Couldn't read `/content/data (1).xlsx` from this Streamlit environment. "
-            "Upload the file using the sidebar instead."
-        )
-        st.stop()
-else:
-    if uploaded is None:
-        st.warning("Upload your Excel file to begin.")
-        st.stop()
-    file_bytes = uploaded.getvalue()
+# =============================
+# 2) Data sanity visuals
+# =============================
+st.subheader("2) Data sanity-check (quick previews)")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.markdown("**Conversion rates** (head)")
+    st.dataframe(conv_tab.head(), use_container_width=True)
+with c2:
+    st.markdown("**Production yields** (head)")
+    st.dataframe(yield_tab.head(), use_container_width=True)
+with c3:
+    st.markdown("**Product parameters** (head)")
+    st.dataframe(params_tab.head(), use_container_width=True)
 
-# Load workbook
-with st.spinner("Loading workbook..."):
-    conv_tab, yield_tab, params_tab, sales_raw = load_workbook(file_bytes)
+with st.expander("Show Sales volume parameters (raw grid preview)", expanded=False):
+    st.dataframe(sales_raw.head(25), use_container_width=True)
 
-# Sheet sanity check preview
-with st.expander("✅ Sanity-check: preview sheets", expanded=False):
-    st.write("**Conversion rates**", conv_tab.head())
-    st.write("**Production yields**", yield_tab.head())
-    st.write("**Product parameters**", params_tab.head())
-    st.write("**Sales volume parameters (raw grid)**", sales_raw.head())
+st.divider()
 
-# Validate + build Parent0 -> Archetype mapping
-required_params = {"Parent0", "Archetype"}
-if not required_params.issubset(set(params_tab.columns)):
-    st.error(f"`Product parameters` must contain columns: {sorted(list(required_params))}")
+# =============================
+# 3) Prep: Parent0 -> Archetype, Yield_Factor, Conversion, and parsing sales inputs
+# =============================
+st.subheader("3) Core transformations (visual + simple)")
+
+# Validate params
+if not {"Parent0", "Archetype"}.issubset(set(params_tab.columns)):
+    st.error("Product parameters must contain columns: Parent0, Archetype")
     st.stop()
 
 params_tab["Parent0"] = params_tab["Parent0"].astype(str).str.strip()
 params_tab["Archetype"] = params_tab["Archetype"].astype(str).str.strip()
 parent_to_arch = params_tab[["Parent0", "Archetype"]].dropna()
 
-# Yield factor prep
-required_yield = {"Parent0", "Planned yield (bu/ac)", "Actual yield"}
-if not required_yield.issubset(set(yield_tab.columns)):
-    st.error(f"`Production yields` must contain columns: {sorted(list(required_yield))}")
+# Validate yield
+need_yield = {"Parent0", "Planned yield (bu/ac)", "Actual yield"}
+if not need_yield.issubset(set(yield_tab.columns)):
+    st.error("Production yields sheet missing one of: Parent0, Planned yield (bu/ac), Actual yield")
     st.stop()
 
 yield_tab["Parent0"] = yield_tab["Parent0"].astype(str).str.strip()
@@ -352,12 +419,13 @@ yield_tab["Planned yield (bu/ac)"] = pd.to_numeric(yield_tab["Planned yield (bu/
 yield_tab["Actual yield"] = pd.to_numeric(yield_tab["Actual yield"], errors="coerce")
 yield_tab["Yield_Factor"] = yield_tab["Actual yield"] / yield_tab["Planned yield (bu/ac)"]
 yield_tab["Yield_Factor"] = yield_tab["Yield_Factor"].replace([np.inf, -np.inf], np.nan)
+
 yield_w_arch = yield_tab.merge(parent_to_arch, on="Parent0", how="left")
 
-# Conversion prep
-required_conv = {"Parent0", "totalConversionRate"}
-if not required_conv.issubset(set(conv_tab.columns)):
-    st.error(f"`Conversion rates` must contain columns: {sorted(list(required_conv))}")
+# Validate conversion
+need_conv = {"Parent0", "totalConversionRate"}
+if not need_conv.issubset(set(conv_tab.columns)):
+    st.error("Conversion rates sheet missing one of: Parent0, totalConversionRate")
     st.stop()
 
 conv_tab["Parent0"] = conv_tab["Parent0"].astype(str).str.strip()
@@ -365,27 +433,58 @@ conv_tab["totalConversionRate"] = pd.to_numeric(conv_tab["totalConversionRate"],
 conv_w_arch = conv_tab.merge(parent_to_arch, on="Parent0", how="left")
 
 # Parse sales inputs
-with st.spinner("Parsing Sales volume parameters (report-style)..."):
-    median_sales_df, growth_df, year_map = extract_median_sales_and_growth(sales_raw)
+try:
+    median_sales_df, growth_df, year_map = extract_sales_inputs(sales_raw)
+except Exception as e:
+    st.error(f"Parsing failed: {e}")
+    st.info("This usually happens if the text labels moved/changed in 'Sales volume parameters'.")
+    st.stop()
 
-with st.expander("🔎 Parsed sales inputs (what was extracted)", expanded=False):
-    st.write("**Median first-year sales (Year 1 baseline)**")
-    st.dataframe(median_sales_df)
-    st.write("**Median growth rates (YoY for Years 2–10)**")
-    st.dataframe(growth_df.head(20))
+# Visual: distribution of Yield_Factor and Conversion
+colA, colB = st.columns(2)
+with colA:
+    st.markdown("**Yield Factor** = Actual yield ÷ Planned yield")
+    fig_y = go.Figure()
+    fig_y.add_trace(go.Histogram(x=yield_w_arch["Yield_Factor"].dropna(), nbinsx=30, name="Yield_Factor"))
+    fig_y.update_layout(height=320, xaxis_title="Yield_Factor", yaxis_title="Count")
+    st.plotly_chart(fig_y, use_container_width=True)
+with colB:
+    st.markdown("**Conversion Rate** = totalConversionRate")
+    fig_c = go.Figure()
+    fig_c.add_trace(go.Histogram(x=conv_w_arch["totalConversionRate"].dropna(), nbinsx=30, name="ConversionRate"))
+    fig_c.update_layout(height=320, xaxis_title="Conversion Rate", yaxis_title="Count")
+    st.plotly_chart(fig_c, use_container_width=True)
 
-# Sidebar controls
-st.sidebar.header("🎛️ Controls")
+with st.expander("Show extracted sales inputs (clean tables)", expanded=False):
+    st.markdown("### Median first-year sales (Year 1 baseline)")
+    st.dataframe(median_sales_df, use_container_width=True)
+    st.markdown("### Median growth rates (Years 2–10 YoY)")
+    st.dataframe(growth_df.head(30), use_container_width=True)
+
+st.divider()
+
+# =============================
+# 4) Interactive "Explain the run"
+# =============================
+st.subheader("4) Interactive explanation (pick a scenario and see the model build)")
+
 archetypes = sorted(median_sales_df["Archetype"].dropna().unique())
 maturities = [85, 95, 105, 115]
 
-selected_arch = st.sidebar.selectbox("Archetype", archetypes)
-selected_mat = st.sidebar.selectbox("Maturity", maturities, index=0)
+left, right = st.columns([1.05, 1.6], gap="large")
 
-prod_loss_rate = st.sidebar.slider("Production loss rate", 0.0, 0.10, 0.02, 0.005)
-carry_loss_rate = st.sidebar.slider("Carryover quality loss rate", 0.0, 0.30, 0.10, 0.01)
+with left:
+    selected_arch = st.selectbox("Archetype", archetypes)
+    selected_mat = st.selectbox("Maturity breakpoint", maturities, index=0)
 
-# Lookup: median sales
+    st.markdown("### Loss assumptions (same logic as your cell)")
+    prod_loss_rate = st.slider("Production quality loss", 0.0, 0.10, 0.02, 0.005)
+    carry_loss_rate = st.slider("Carryover quality loss", 0.0, 0.30, 0.10, 0.01)
+
+    # Year breakdown selector for the waterfall
+    year_breakdown = st.selectbox("Show inventory breakdown for year", [f"Year {i}" for i in range(1, 11)], index=0)
+
+# Lookups
 row_ms = median_sales_df[median_sales_df["Archetype"] == selected_arch]
 y1 = None
 if not row_ms.empty:
@@ -393,83 +492,119 @@ if not row_ms.empty:
     if not v.empty:
         y1 = float(v.iloc[0])
 
-# Lookup: YoY rates
 row_gr = growth_df[(growth_df["Archetype"] == selected_arch) & (growth_df["Maturity"] == selected_mat)]
 yoy_rates = None
 if not row_gr.empty:
     yoy_rates = [to_rate(row_gr[year_map[y]].iloc[0]) for y in range(2, 11)]
 
-# Archetype-specific means for yield and conversion (fallback to overall)
+# Archetype means
 y_vals = yield_w_arch.loc[yield_w_arch["Archetype"] == selected_arch, "Yield_Factor"].dropna()
 c_vals = conv_w_arch.loc[conv_w_arch["Archetype"] == selected_arch, "totalConversionRate"].dropna()
-
 y_mean = float(y_vals.mean()) if len(y_vals) else float(yield_w_arch["Yield_Factor"].dropna().mean())
 c_mean = float(c_vals.mean()) if len(c_vals) else float(conv_w_arch["totalConversionRate"].dropna().mean())
 
-# Main output layout
-left, right = st.columns([1.1, 1.4], gap="large")
-
-with left:
-    st.subheader("1) Inputs used for this run")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Archetype", selected_arch)
-    c2.metric("Maturity", str(selected_mat))
-    c3.metric("Year-1 Median Sales", "N/A" if y1 is None else f"{y1:,.1f}")
-
-    st.markdown("**Archetype-specific assumptions (means)**")
-    a1, a2 = st.columns(2)
-    a1.metric("Yield Factor (mean)", f"{y_mean:.4f}")
-    a2.metric("Conversion Rate (mean)", f"{c_mean:.4f}")
-
-    st.markdown("**YoY rates used (Years 2–10)**")
-    if yoy_rates is None:
-        st.error("No growth rates found for this Archetype + Maturity.")
-    else:
-        yoy_df = pd.DataFrame(
-            {"Year": [f"Year {i}" for i in range(2, 11)], "YoY Rate (decimal)": yoy_rates}
-        )
-        st.dataframe(yoy_df, use_container_width=True)
-
 with right:
-    st.subheader("2) Simulation Output")
+    # Metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Year-1 median sales", "N/A" if y1 is None else f"{y1:,.1f}")
+    m2.metric("Yield mean (arch)", f"{y_mean:.4f}")
+    m3.metric("Conv mean (arch)", f"{c_mean:.4f}")
+    m4.metric("YoY years", "2..10")
 
     if y1 is None:
-        st.error("No median first-year sales found for this Archetype + Maturity.")
+        st.error("No median first-year sales found for this archetype/maturity.")
         st.stop()
     if yoy_rates is None:
+        st.error("No growth rates found for this archetype/maturity.")
         st.stop()
 
+    # Build
     sales = build_sales_curve(y1, yoy_rates)
-    lifecycle_df = simulate_inventory(
-        sales, y_mean, c_mean, prod_loss_rate=prod_loss_rate, carry_loss_rate=carry_loss_rate
-    )
-
-    st.markdown("**Lifecycle table (Year 1–Year 10)**")
-    st.dataframe(lifecycle_df.round(1), use_container_width=True)
-
+    lifecycle_df = simulate_inventory(sales, y_mean, c_mean, prod_loss_rate=prod_loss_rate, carry_loss_rate=carry_loss_rate)
     remaining = lifecycle_df.loc["Remaining inventory (carryover out)"].astype(float).values
 
-    fig = plot_sales_vs_inventory(
+    # Visual: Sales curve build
+    fig_sales_build = chart_sales_build(sales, yoy_rates)
+    st.plotly_chart(fig_sales_build, use_container_width=True)
+
+    # Visual: Final output plot
+    fig_out = chart_sales_and_inventory(
         sales,
         remaining,
-        title=f"Inventory Lifecycle – {selected_arch} | Maturity {selected_mat} (Archetype-specific Yield & Conv)",
+        title=f"Sales vs Remaining Inventory — {selected_arch} | Maturity {selected_mat}"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig_out, use_container_width=True)
 
-# Optional: show the sales-only plot
-with st.expander("📉 Sales curve only", expanded=False):
-    cols = [f"Year {i}" for i in range(1, 11)]
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=cols, y=sales, mode="lines+markers", name="Sales"))
-    fig2.update_layout(title="Sales (Year1..Year10)", xaxis_title="Year", yaxis_title="Sales", height=420)
-    st.plotly_chart(fig2, use_container_width=True)
+st.divider()
 
-# Optional: quick diagnostics
-with st.expander("🧪 Diagnostics (optional)", expanded=False):
-    st.write("Rows with missing Archetype after mapping (Yield table):")
-    st.write(int(yield_w_arch["Archetype"].isna().sum()))
-    st.write("Rows with missing Archetype after mapping (Conversion table):")
-    st.write(int(conv_w_arch["Archetype"].isna().sum()))
+# =============================
+# 5) Explain the inventory math with a per-year breakdown (visual)
+# =============================
+st.subheader("5) Visual: explain the inventory math (one year breakdown)")
+st.caption(
+    "This visual answers: 'What happened in a given year?' "
+    "Carryover comes in → we apply carryover loss → we add new production → apply production loss → sell units → leftover becomes next carryover."
+)
 
-st.caption("Tip: If parsing fails, it usually means the 'Sales volume parameters' sheet text labels changed or moved.")
+# Get values for selected year index
+yr_idx = int(year_breakdown.split()[-1]) - 1  # 0-based
+cols = [f"Year {i}" for i in range(1, 11)]
+col = cols[yr_idx]
+
+carry_in = float(lifecycle_df.loc["Carryover inventory from prior year", col])
+carry_loss = float(lifecycle_df.loc["Carryover quality loss", col])           # negative
+planned = float(lifecycle_df.loc["Planned production (= next yr sales)", col])
+new_prod = float(lifecycle_df.loc["New production (after yield & conv.)", col])
+prod_loss = float(lifecycle_df.loc["Production quality loss", col])           # negative
+sales_this = float(lifecycle_df.loc["Sales", col])
+
+wf = chart_inventory_waterfall(
+    year_label=col,
+    carry_in=carry_in,
+    carry_loss=carry_loss,
+    new_prod=new_prod,
+    prod_loss=prod_loss,
+    sales=sales_this
+)
+st.plotly_chart(wf, use_container_width=True)
+
+st.divider()
+
+# =============================
+# 6) Show the lifecycle table + allow download
+# =============================
+st.subheader("6) Lifecycle table (what the cell outputs)")
+st.dataframe(lifecycle_df.round(1), use_container_width=True)
+
+csv = lifecycle_df.round(4).to_csv().encode("utf-8")
+st.download_button("⬇️ Download lifecycle table as CSV", data=csv, file_name="lifecycle_table.csv", mime="text/csv")
+
+st.divider()
+
+# =============================
+# 7) A script you can read while showing the visuals
+# =============================
+with st.expander("🎤 Presentation script (read this while demoing)", expanded=True):
+    st.markdown(
+        f"""
+**Here’s what I did in this cell (while pointing at the visuals):**
+
+1) **Loaded 4 Excel sheets** and cleaned column names so merges work reliably.  
+2) From **Product parameters**, I created a mapping **`Parent0 → Archetype`**.  
+3) From **Production yields**, I computed **Yield_Factor = Actual ÷ Planned** and merged Archetype onto each yield row.  
+4) From **Conversion rates**, I converted `totalConversionRate` to numeric and merged Archetype onto each conversion row.  
+5) From the report-style **Sales volume parameters** sheet, I **extracted two clean tables**:
+   - **Median first-year sales** (Year 1 baseline) by Archetype and maturity {maturities}
+   - **Median growth rates** (Years 2–10) by Archetype and maturity  
+6) When I select **Archetype = `{selected_arch}`** and **Maturity = `{selected_mat}`**, the model:
+   - pulls **Year 1 median sales** and **YoY rates**  
+   - computes **archetype-specific means** for Yield_Factor and Conversion Rate  
+7) I then **built a 10-year sales curve** by compounding YoY rates year over year.  
+8) Finally, I ran the **inventory lifecycle simulation**:
+   - planned production = next year’s sales  
+   - new production = planned production × yield_mean × conv_mean  
+   - apply **{prod_loss_rate:.3f}** production loss and **{carry_loss_rate:.3f}** carryover loss  
+   - leftover becomes next year’s carryover  
+9) The outputs are the **lifecycle table**, the **Sales vs Inventory plot**, and the **year-by-year breakdown** chart.
+"""
+    )
